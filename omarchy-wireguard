@@ -40,7 +40,9 @@ demo() { [[ -f $STATE_DIR/demo ]]; }
 
 expected_version() { sed -n 's/^VERSION=//p' "$BUNDLED_ROOT_HELPER" 2>/dev/null | head -n 1; }
 
-live_names() { ip -j link show type wireguard 2>/dev/null | jq -r '.[].ifname'; }
+# iproute2 7.2 emits an empty {} for every link the type filter skips, so
+# drop entries without a name rather than reading them as "null".
+live_names() { ip -j link show type wireguard 2>/dev/null | jq -r '.[] | .ifname // empty'; }
 
 # resolvectl prints "Link 70 (wg0): 10.8.0.53 10.8.0.54" -> ["10.8.0.53","10.8.0.54"]
 resolved_list() {
