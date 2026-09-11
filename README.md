@@ -82,6 +82,12 @@ Defaults!/usr/local/libexec/omarchy-wireguard/omarchy-wireguard-root !log_allowe
 you ALL=(root) NOPASSWD: /usr/local/libexec/omarchy-wireguard/omarchy-wireguard-root
 ```
 
+`install-helper` never has root re-read a file you can write to. It hands the
+helper to root once, over stdin that is opened before `sudo` runs. Root stages
+the helper and the rule in root-only directories beside their destinations,
+checks the staged copies (`bash -n`, `visudo -c`), and renames them into
+place. It then confirms the installed helper is byte-for-byte the plugin's copy.
+
 The helper does four things and nothing else:
 
 | Command | Does |
