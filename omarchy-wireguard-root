@@ -9,10 +9,12 @@
 # The command surface is fixed, and the only argument it accepts is a bare
 # tunnel name (never a path), so it can't be pointed at another config file:
 #
-#   version     helper protocol version, so the widget can spot a stale copy
-#   status      every configured and live tunnel, as JSON (no secrets)
-#   up NAME     wg-quick up NAME     (NAME must have a config in /etc/wireguard)
-#   down NAME   wg-quick down NAME
+#   version       helper protocol version, so the widget can spot a stale copy
+#   status        every configured and live tunnel, as JSON (no secrets)
+#   up NAME       wg-quick up NAME     (NAME must have a config in /etc/wireguard)
+#   down NAME     wg-quick down NAME
+#   enable NAME   systemctl enable wg-quick@NAME    (start it at boot)
+#   disable NAME  systemctl disable wg-quick@NAME
 #
 # Private and preshared keys never leave this script: config files are read
 # through a whitelist of non-secret keys, and of `wg show dump` only the peer
@@ -22,11 +24,14 @@ set -euo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
 umask 077
 
-VERSION=1
+VERSION=2
 CONF_DIR=/etc/wireguard
 # wg-quick's own interface-name rule, minus a leading "-" (which wg and
 # wg-quick would read as an option).
 NAME_RE='^[A-Za-z0-9_=+][A-Za-z0-9_=+.-]{0,14}$'
+# systemd unit names can't hold the "=" or "+" that interface names can, so
+# only these tunnels have a wg-quick@NAME unit to start at boot.
+UNIT_RE='^[A-Za-z0-9_.-]+$'
 
 fail() { echo "omarchy-wireguard-root: $*" >&2; exit 2; }
 
@@ -65,6 +70,9 @@ status() {
       [[ -L $CONF_DIR/$name.conf ]] && continue
       printf 'conf\t%s\n' "$name"
       conf_lines "$name"
+      if [[ $name =~ $UNIT_RE ]]; then
+        printf 'i\tautostart\t%s\n' "$(systemctl is-enabled "wg-quick@$name.service" 2>/dev/null || true)"
+      fi
     done
     for name in "${live[@]}"; do
       [[ $name =~ $NAME_RE ]] || continue
@@ -78,7 +86,8 @@ status() {
     def items: split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""));
     def num: tonumber? // null;
     reduce (inputs | split("\t")) as $f ({version: $version, configs: {}, live: {}, c: null, l: null};
-      if $f[0] == "conf" then .c = $f[1] | .l = null | .configs[$f[1]] = {addresses: [], dns: [], peers: []}
+      # autostart stays null for a tunnel with no unit name (see UNIT_RE).
+      if $f[0] == "conf" then .c = $f[1] | .l = null | .configs[$f[1]] = {addresses: [], dns: [], peers: [], autostart: null}
       elif $f[0] == "live" then .l = $f[1] | .c = null | .live[$f[1]] = {listenPort: ($f[2] | num), peers: []}
       elif $f[0] == "peer" and .l != null then .live[.l].peers += [{
           publicKey: $f[1],
@@ -101,6 +110,7 @@ status() {
         elif $f[1] == "postupdns" then .configs[$c].dns += [$f[2] | scan("resolvectl dns \\S+ ([^;&|]+)") | .[0] | split(" ")[] | select(. != "")]
         elif $f[1] == "mtu" then .configs[$c].mtu = ($f[2] | num)
         elif $f[1] == "listenport" then .configs[$c].listenPort = ($f[2] | num)
+        elif $f[1] == "autostart" then .configs[$c].autostart = ($f[2] == "enabled")
         else . end
       else . end)
     | del(.c, .l)
@@ -115,5 +125,11 @@ case ${1:-} in
     name=$(configured "$2")
     exec wg-quick "$1" "$name"
     ;;
-  *) fail "usage: version | status | up NAME | down NAME" ;;
+  enable|disable)
+    [[ $# -eq 2 ]] || fail "usage: $1 NAME"
+    name=$(configured "$2")
+    [[ $name =~ $UNIT_RE ]] || fail "systemd can't start $name at boot: unit names can't contain = or +"
+    exec systemctl "$1" "wg-quick@$name.service"
+    ;;
+  *) fail "usage: version | status | up NAME | down NAME | enable NAME | disable NAME" ;;
 esac

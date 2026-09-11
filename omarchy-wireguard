@@ -3,6 +3,7 @@
 #
 #   omarchy-wireguard [json]                     every tunnel's state, as JSON
 #   omarchy-wireguard up|down|restart NAME       drive a wg-quick tunnel
+#   omarchy-wireguard enable|disable NAME        start it at boot, or stop doing so
 #   omarchy-wireguard probe HOST                 round-trip time to HOST (JSON)
 #   omarchy-wireguard notify NAME STATE SUMMARY [BODY]
 #                                                desktop notification, sent once
@@ -131,14 +132,14 @@ demo_json() {
        helper: {installed: true, version: "demo", expected: "demo"},
        tunnels: [
          {name: "office", configured: true, up: true, drivenAt: null,
-          config: {addresses: ["10.8.0.2/24"], dns: ["10.8.0.1"],
+          config: {addresses: ["10.8.0.2/24"], dns: ["10.8.0.1"], autostart: true,
                    peers: [{publicKey: $officeKey, endpoint: "vpn.example.com:51820", allowedIps: $officeRoutes, keepalive: 25}]},
           rx: $rx, tx: $tx, addresses: ["10.8.0.2/24"], mtu: 1420, dns: ["10.8.0.1"], domains: ["~corp.example.com"],
           listenPort: 51820,
           peers: [{publicKey: $officeKey, endpoint: "203.0.113.10:51820", allowedIps: $officeRoutes,
                    handshake: $hs, rx: $rx, tx: $tx, keepalive: 25, endpointHost: "vpn.example.com:51820"}]},
          {name: "home", configured: true, up: false, drivenAt: null,
-          config: {addresses: ["10.9.0.5/32"], dns: [],
+          config: {addresses: ["10.9.0.5/32"], dns: [], autostart: false,
                    peers: [{publicKey: $homeKey, endpoint: "home.example.net:51820", allowedIps: ["192.168.1.0/24"], keepalive: 25}]},
           rx: 0, tx: 0, addresses: [], mtu: null, dns: [], domains: [], listenPort: null, peers: null}
        ]}'
@@ -185,6 +186,19 @@ drive() {  # drive up|down|restart NAME
   else die "$complaint"; fi
 }
 
+# Enables or disables wg-quick@NAME.service. Only the next boot changes; the
+# tunnel stays up or down as it is now.
+set_autostart() {  # set_autostart enable|disable NAME
+  local verb=$1 name=${2:-} have log
+  demo && die "demo mode is on (remove $STATE_DIR/demo)"
+  valid_name "$name" || die "invalid tunnel name: '$name'"
+  have=$(sudo -n "$ROOT_HELPER" version 2>/dev/null) || die "the root helper isn't installed; run install-helper"
+  [[ $have == "$(expected_version)" ]] || die "the root helper is out of date; run install-helper"
+
+  if log=$(sudo -n "$ROOT_HELPER" "$verb" "$name" 2>&1); then jq -cn '{ok: true}'
+  else die "$(tail -n 1 <<<"$log" | sed 's/^omarchy-wireguard-root: //')"; fi
+}
+
 probe() {
   local host=${1:-} ms
   [[ $host =~ ^[A-Za-z0-9.:-]{1,253}$ ]] || die "invalid host: '$host'"
@@ -221,7 +235,8 @@ notify_once() {  # notify_once NAME STATE SUMMARY [BODY]
 case ${1:-json} in
   json) status_json ;;
   up|down|restart) drive "$1" "${2:-}" ;;
+  enable|disable) set_autostart "$1" "${2:-}" ;;
   probe) probe "${2:-}" ;;
   notify) shift; notify_once "$@" ;;
-  *) echo "usage: omarchy-wireguard [json | up|down|restart NAME | probe HOST | notify NAME STATE SUMMARY [BODY]]" >&2; exit 2 ;;
+  *) echo "usage: omarchy-wireguard [json | up|down|restart NAME | enable|disable NAME | probe HOST | notify NAME STATE SUMMARY [BODY]]" >&2; exit 2 ;;
 esac

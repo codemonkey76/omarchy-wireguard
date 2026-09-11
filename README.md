@@ -19,6 +19,8 @@ connect or disconnect.
     tunnel address, DNS servers and routing domains, listen port and MTU, and
     the peer's key
   - the routes (AllowedIPs) the tunnel carries
+  - a *Start at boot* switch, which enables or disables `wg-quick@NAME.service`
+    (it changes the next boot only, not whether the tunnel is up now)
   - a list of every tunnel, each with its own switch, when you have more than one
   - reconnect, refresh and copy buttons
 - **Notifications** when a tunnel drops, stops handshaking or recovers on its
@@ -88,7 +90,7 @@ the helper and the rule in root-only directories beside their destinations,
 checks the staged copies (`bash -n`, `visudo -c`), and renames them into
 place. It then confirms the installed helper is byte-for-byte the plugin's copy.
 
-The helper does four things and nothing else:
+The helper does six things and nothing else:
 
 | Command | Does |
 |---|---|
@@ -96,6 +98,8 @@ The helper does four things and nothing else:
 | `status` | describes every configured and live tunnel as JSON, without secrets |
 | `up NAME` | `wg-quick up NAME` |
 | `down NAME` | `wg-quick down NAME` |
+| `enable NAME` | `systemctl enable wg-quick@NAME`, so the tunnel starts at boot |
+| `disable NAME` | `systemctl disable wg-quick@NAME` |
 
 `NAME` must be a bare tunnel name with a config already in `/etc/wireguard`,
 never a path. That matters because `wg-quick` runs a config's
@@ -173,6 +177,7 @@ The bundled `omarchy-wireguard` script works on its own too:
 ```bash
 omarchy-wireguard json            # every tunnel's state, as JSON
 omarchy-wireguard up wg0          # also: down, restart
+omarchy-wireguard enable wg0      # start at boot; disable to stop
 omarchy-wireguard probe 10.8.0.1  # round-trip time in ms
 ```
 
@@ -188,7 +193,8 @@ and gathers everything in one pass:
   `sudo -n` call to the root helper
 
 Rates come from the difference between two polls. Connecting and disconnecting
-go through the root helper's `up` and `down`.
+go through the root helper's `up` and `down`, and the boot switch through its
+`enable` and `disable`.
 
 `DNS =` in a config works only when `resolvconf` is installed. On a
 systemd-resolved host the usual workaround is

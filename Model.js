@@ -21,6 +21,7 @@ var ICON_PULSE = "󰐰"
 var ICON_DNS = "󰇧"         // md-earth
 var ICON_ROUTE = "󰌘"       // md-lan_connect
 var ICON_LISTEN = "󰓡"      // md-swap_horizontal
+var ICON_BOOT = "󰐥"        // md-power
 
 // Array.isArray fails on lists that have been through a QML model (a Repeater
 // hands its delegates QVariantList, not a JS Array), so check for the shape.

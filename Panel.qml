@@ -83,6 +83,11 @@ Panel {
     if (selected.config && selected.config.peers && selected.config.peers.length) return selected.config.peers[0]
     return null
   }
+  // Whether wg-quick@NAME.service is enabled; null when the helper can't say
+  // (it predates the switch, or systemd can't take the name), which hides it.
+  readonly property var selectedAutostart: selected && selected.config && typeof selected.config.autostart === "boolean"
+    ? selected.config.autostart : null
+  readonly property bool bootBusy: bootProc.running
   readonly property bool canDrive: privileged && selected !== null && selected.configured && busyTunnel === ""
   readonly property string overallState: busyTunnel !== "" ? "busy" : Model.overall(tunnels, now)
 
@@ -316,6 +321,34 @@ Panel {
       if (exitCode !== 0 && !wg.messageIsError) wg.flash(driveProc.verb + " " + driveProc.tunnelName + " failed", true)
       wg.refresh()
     }
+  }
+
+  // ---- Start at boot ------------------------------------------------------
+  // Enables or disables wg-quick@NAME.service. The tunnel stays up or down as
+  // it is; that is the power switch's job.
+  function setAutostart(tunnel, on) {
+    if (!tunnel || !tunnel.configured || !privileged || bootProc.running) return
+    bootProc.autostart = on
+    bootProc.tunnelName = tunnel.name
+    bootProc.command = ["bash", wg.cli, on ? "enable" : "disable", tunnel.name]
+    bootProc.running = true
+  }
+
+  Process {
+    id: bootProc
+    property bool autostart: false
+    property string tunnelName: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var result = null
+        try { result = JSON.parse(String(text || "").trim()) } catch (e) {}
+        var label = Model.label(wg.tunnelNamed(bootProc.tunnelName) || { name: bootProc.tunnelName }, wg.labels)
+        if (result && result.ok === true) wg.flash(label + (bootProc.autostart ? " will start at boot" : " won't start at boot"), false)
+        else wg.flash(result && result.error ? result.error : "Couldn't change whether " + label + " starts at boot", true)
+      }
+    }
+    onExited: wg.refresh()
   }
 
   Timer {
@@ -657,6 +690,17 @@ Panel {
               value: wg.selectedPeer ? Model.shortKey(wg.selectedPeer.publicKey) : ""
               copyValue: wg.selectedPeer ? wg.selectedPeer.publicKey : ""
             }
+
+            SwitchRow {
+              visible: wg.privileged && wg.selected !== null && wg.selected.configured && wg.selectedAutostart !== null
+              icon: Model.ICON_BOOT
+              label: "Start at boot"
+              checked: wg.selectedAutostart === true
+              busy: wg.bootBusy
+              interactive: wg.privileged
+              hint: wg.selected ? (wg.selectedAutostart ? "Disable" : "Enable") + " wg-quick@" + wg.selected.name + ".service" : ""
+              onToggled: wg.setAutostart(wg.selected, wg.selectedAutostart !== true)
+            }
           }
 
           // ---------- Routes carried by the tunnel ----------
@@ -853,6 +897,64 @@ Panel {
       fontFamily: wg.fontFamily
       fontSize: Style.font.bodySmall
       onClicked: wg.copy(row.copyValue)
+    }
+  }
+
+  // An InfoRow whose value is a switch.
+  component SwitchRow: Item {
+    id: switchRow
+    property string icon: ""
+    property string label: ""
+    property string hint: ""
+    property bool checked: false
+    property bool busy: false
+    property bool interactive: true
+    signal toggled()
+
+    width: parent ? parent.width : implicitWidth
+    implicitHeight: Math.max(switchLabel.implicitHeight, rowToggle.implicitHeight)
+
+    Text {
+      id: switchIcon
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(20)
+      text: switchRow.icon
+      textFormat: Text.PlainText
+      color: wg.dim
+      font.family: wg.fontFamily
+      font.pixelSize: Style.font.body
+    }
+
+    Text {
+      id: switchLabel
+      anchors.left: switchIcon.right
+      anchors.right: rowToggle.left
+      anchors.rightMargin: Style.space(6)
+      anchors.verticalCenter: parent.verticalCenter
+      text: switchRow.label
+      textFormat: Text.PlainText
+      color: wg.dim
+      font.family: wg.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      elide: Text.ElideRight
+    }
+
+    ToggleSwitch {
+      id: rowToggle
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      checked: switchRow.checked
+      busy: switchRow.busy
+      interactive: switchRow.interactive
+      foreground: wg.fg
+      onToggled: switchRow.toggled()
+
+      PanelToolTip {
+        visible: rowToggle.containsMouse && switchRow.hint !== ""
+        text: switchRow.hint
+        fontFamily: wg.fontFamily
+      }
     }
   }
 
