@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# WireGuard helper for the io.github.codemonkey76.wireguard Omarchy widget.
+#
+#   omarchy-wireguard [json]                     every tunnel's state, as JSON
+#   omarchy-wireguard up|down|restart NAME       drive a wg-quick tunnel
+#   omarchy-wireguard probe HOST                 round-trip time to HOST (JSON)
+#   omarchy-wireguard notify NAME STATE SUMMARY [BODY]
+#                                                desktop notification, sent once
+#                                                per tunnel+state within 30s
+#
+# This script runs as you. Everything that needs root goes through the root
+# helper (omarchy-wireguard-root, installed by install-helper) in a single
+# `sudo -n` call, so it never prompts. Without the root helper the widget
+# still shows which interfaces are up, their addresses, traffic and DNS, just
+# not configs, peers, handshakes or the switches.
+
+set -uo pipefail
+
+ROOT_HELPER=/usr/local/libexec/omarchy-wireguard/omarchy-wireguard-root
+BUNDLED_ROOT_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/omarchy-wireguard-root"
+
+# Shared between every copy of the widget (there is one per monitor): when a
+# tunnel was last driven from here, and which notifications went out recently.
+STATE_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache}/omarchy-wireguard"
+
+die() { jq -cn --arg e "$*" '{ok: false, error: $e}'; exit 1; }
+
+valid_name() { [[ $1 =~ ^[A-Za-z0-9_=+][A-Za-z0-9_=+.-]{0,14}$ ]]; }
+
+in_list() {  # in_list NEEDLE ITEMS...
+  local needle=$1; shift
+  local item
+  for item in "$@"; do [[ $item == "$needle" ]] && return 0; done
+  return 1
+}
+
+# Demo mode, for screenshots: `touch "$XDG_RUNTIME_DIR/omarchy-wireguard/demo"`
+# and the widget shows made-up tunnels instead of yours. Remove it to go back.
+demo() { [[ -f $STATE_DIR/demo ]]; }
+
+expected_version() { sed -n 's/^VERSION=//p' "$BUNDLED_ROOT_HELPER" 2>/dev/null | head -n 1; }
+
+live_names() { ip -j link show type wireguard 2>/dev/null | jq -r '.[].ifname'; }
+
+# resolvectl prints "Link 70 (wg0): 10.8.0.53 10.8.0.54" -> ["10.8.0.53","10.8.0.54"]
+resolved_list() {
+  resolvectl "$1" "$2" 2>/dev/null | sed 's/^[^:]*:[[:space:]]*//' |
+    jq -Rsc 'split("\n") | map(split(" ")) | add // [] | map(select(. != ""))'
+}
+
+# What anyone can see about a live interface, plus the port and peers the root
+# helper reported for it (null without the helper).
+live_json() {  # live_json NAME PRIV_LIVE_ENTRY
+  local name=$1 priv=$2 rx tx addrs mtu dns domains
+  rx=$(cat "/sys/class/net/$name/statistics/rx_bytes" 2>/dev/null); [[ $rx =~ ^[0-9]+$ ]] || rx=0
+  tx=$(cat "/sys/class/net/$name/statistics/tx_bytes" 2>/dev/null); [[ $tx =~ ^[0-9]+$ ]] || tx=0
+  addrs=$(ip -j addr show dev "$name" 2>/dev/null | jq -c '[.[0].addr_info[]? | "\(.local)/\(.prefixlen)"]')
+  mtu=$(ip -j link show dev "$name" 2>/dev/null | jq '.[0].mtu // null')
+  dns=$(resolved_list dns "$name")
+  domains=$(resolved_list domain "$name")
+  jq -cn --argjson rx "$rx" --argjson tx "$tx" --argjson addrs "${addrs:-[]}" \
+    --argjson mtu "${mtu:-null}" --argjson dns "${dns:-[]}" --argjson domains "${domains:-[]}" \
+    --argjson priv "${priv:-null}" '
+    {rx: $rx, tx: $tx, addresses: $addrs, mtu: $mtu, dns: $dns, domains: $domains,
+     listenPort: ($priv.listenPort // null),
+     peers: (if $priv == null then null else $priv.peers end)}'
+}
+
+status_json() {
+  demo && { demo_json; return; }
+
+  local priv root=false installed=false confs lives name conf live driven objs=()
+  [[ -x $ROOT_HELPER ]] && installed=true
+  if priv=$(sudo -n "$ROOT_HELPER" status 2>/dev/null) && jq -e '.version' <<<"$priv" >/dev/null 2>&1; then
+    root=true
+  else
+    priv='{"version": null, "configs": {}, "live": {}}'
+  fi
+
+  mapfile -t confs < <(jq -r '.configs | keys[]' <<<"$priv")
+  mapfile -t lives < <(live_names; jq -r '.live | keys[]' <<<"$priv")
+
+  while read -r name; do
+    [[ -n $name ]] && valid_name "$name" || continue
+    conf=$(jq -c --arg n "$name" '.configs[$n] // null' <<<"$priv")
+    live=null
+    in_list "$name" "${lives[@]}" && live=$(live_json "$name" "$(jq -c --arg n "$name" '.live[$n] // null' <<<"$priv")")
+    driven=$(stat -c %Y "$STATE_DIR/$name.driven" 2>/dev/null) || driven=null
+    objs+=("$(jq -cn --arg name "$name" --argjson conf "${conf:-null}" --argjson live "${live:-null}" \
+      --argjson driven "$driven" '
+      {name: $name, configured: ($conf != null), up: ($live != null), drivenAt: $driven, config: $conf}
+      + ($live // {rx: 0, tx: 0, addresses: [], mtu: null, dns: [], domains: [], listenPort: null, peers: null})
+      # The kernel only knows the resolved endpoint IP; carry the configured
+      # hostname across so the panel can show vpn.example.com rather than an IP.
+      | if (.peers | type) == "array" and $conf != null then
+          .peers |= map(. as $p | . + {endpointHost:
+            ([$conf.peers[] | select(.publicKey == $p.publicKey) | .endpoint][0] // null)})
+        else . end')")
+  done < <(printf '%s\n' "${confs[@]}" "${lives[@]}" | sort -u)
+
+  printf '%s\n' "${objs[@]}" | grep -v '^$' |
+    jq -cs --argjson now "$(date +%s)" --argjson root "$root" --argjson installed "$installed" \
+      --arg version "$(jq -r '.version // empty' <<<"$priv")" --arg expected "$(expected_version)" '
+      {now: $now, privileged: $root,
+       helper: {installed: $installed,
+                version: (if $version == "" then null else $version end),
+                expected: (if $expected == "" then null else $expected end)},
+       tunnels: .}'
+}
+
+# Made-up tunnels for screenshots. Counters are integrals of wandering,
+# always-positive rates, so the graph moves like real traffic and the counters
+# only ever grow (they wrap every two hours, which the widget treats as a
+# restarted interface).
+demo_json() {
+  local now t rx tx
+  now=$(date +%s)
+  t=$(date +%s.%N)
+  read -r rx tx < <(awk -v t="$t" 'BEGIN {
+    t = t % 7200
+    rx = 1400000 * t - 6300000 * cos(t / 7) + 805000 * sin(t / 2.3) + 6300000
+    tx = 200000 * t - 600000 * cos(t / 5) + 102000 * sin(t / 1.7) + 600000
+    printf "%.0f %.0f\n", rx, tx }')
+  jq -cn --argjson now "$now" --argjson rx "$rx" --argjson tx "$tx" --argjson hs "$((now - 3 - now % 41))" '
+    ["10.8.0.0/24", "192.168.50.0/24", "172.20.0.0/16"] as $officeRoutes
+    | "Hq8vN3kR2mXw7LpT9sYc4bJ6fA1dG5eZ0uV8iO3nQ2c=" as $officeKey
+    | "pX5wM2qL8rT1yK7vB4nC9dF6gH3jS0aE2uI5oZ8lW4k=" as $homeKey
+    | {now: $now, privileged: true,
+       helper: {installed: true, version: "demo", expected: "demo"},
+       tunnels: [
+         {name: "office", configured: true, up: true, drivenAt: null,
+          config: {addresses: ["10.8.0.2/24"], dns: ["10.8.0.1"],
+                   peers: [{publicKey: $officeKey, endpoint: "vpn.example.com:51820", allowedIps: $officeRoutes, keepalive: 25}]},
+          rx: $rx, tx: $tx, addresses: ["10.8.0.2/24"], mtu: 1420, dns: ["10.8.0.1"], domains: ["~corp.example.com"],
+          listenPort: 51820,
+          peers: [{publicKey: $officeKey, endpoint: "203.0.113.10:51820", allowedIps: $officeRoutes,
+                   handshake: $hs, rx: $rx, tx: $tx, keepalive: 25, endpointHost: "vpn.example.com:51820"}]},
+         {name: "home", configured: true, up: false, drivenAt: null,
+          config: {addresses: ["10.9.0.5/32"], dns: [],
+                   peers: [{publicKey: $homeKey, endpoint: "home.example.net:51820", allowedIps: ["192.168.1.0/24"], keepalive: 25}]},
+          rx: 0, tx: 0, addresses: [], mtu: null, dns: [], domains: [], listenPort: null, peers: null}
+       ]}'
+}
+
+# Marks the tunnel as changed on purpose, so no widget copy announces it.
+mark_driven() { mkdir -p -m 700 "$STATE_DIR" && touch "$STATE_DIR/$1.driven"; }
+
+drive() {  # drive up|down|restart NAME
+  local verb=$1 name=${2:-} log rc reached=false complaint
+  demo && die "demo mode is on (remove $STATE_DIR/demo)"
+  valid_name "$name" || die "invalid tunnel name: '$name'"
+  sudo -n "$ROOT_HELPER" version >/dev/null 2>&1 || die "the root helper isn't installed; run install-helper"
+
+  mark_driven "$name"
+  case $verb in
+    up|down) log=$(sudo -n "$ROOT_HELPER" "$verb" "$name" 2>&1); rc=$? ;;
+    restart) log=$(sudo -n "$ROOT_HELPER" down "$name" 2>&1; sudo -n "$ROOT_HELPER" up "$name" 2>&1); rc=$? ;;
+  esac
+  # Again on completion: the quiet window runs from when the change landed,
+  # not from when it was asked for.
+  mark_driven "$name"
+
+  # wg-quick echoes every step as "[#] ..." on stderr; the useful line is the
+  # last one that is not a trace.
+  complaint=$(grep -v '^\[#\]' <<<"$log" | tail -n 1)
+
+  # The root helper refusing the request (bad name, no such config) is always
+  # a failure, whatever state the interface happens to be in.
+  [[ $complaint == omarchy-wireguard-root:* ]] && die "${complaint#omarchy-wireguard-root: }"
+
+  # wg-quick exits non-zero when a hook fails even if the tunnel went where it
+  # was asked — e.g. `PostDown = resolvectl revert %i`, which runs after the
+  # interface is already deleted. Judge by the end state and pass the
+  # complaint on as a warning. (A failed PostUp makes wg-quick tear the
+  # interface down again, so that still reads as a failure.)
+  case $verb in
+    down) ip link show dev "$name" >/dev/null 2>&1 || reached=true ;;
+    *)    ip link show dev "$name" >/dev/null 2>&1 && reached=true ;;
+  esac
+
+  if ((rc == 0)); then jq -cn '{ok: true}'
+  elif $reached; then jq -cn --arg w "$complaint" '{ok: true, warning: $w}'
+  else die "$complaint"; fi
+}
+
+probe() {
+  local host=${1:-} ms
+  [[ $host =~ ^[A-Za-z0-9.:-]{1,253}$ ]] || die "invalid host: '$host'"
+  if demo; then
+    ms=$((12 + $(date +%s) % 7))
+  else
+    ms=$(ping -n -c 1 -W 1 "$host" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\).*/\1/p' | head -n 1)
+  fi
+  jq -cn --arg host "$host" --arg ms "$ms" \
+    '{host: $host, ms: (if $ms == "" then null else ($ms | tonumber) end)}'
+}
+
+# Every monitor runs its own copy of the widget, and each notices the same
+# change within a poll or two. The first to get here sends it; the rest find a
+# fresh marker for that tunnel+state and stay quiet.
+notify_once() {  # notify_once NAME STATE SUMMARY [BODY]
+  local name=${1:-} state=${2:-} summary=${3:-} body=${4:-}
+  valid_name "$name" || die "invalid tunnel name: '$name'"
+  [[ $state =~ ^[a-z]{1,20}$ ]] || die "invalid state: '$state'"
+  demo && return 0
+  mkdir -p -m 700 "$STATE_DIR"
+  (
+    flock -w 2 9 || exit 0
+    local marker="$STATE_DIR/$name.$state.notified" age
+    if [[ -f $marker ]]; then
+      age=$(( $(date +%s) - $(stat -c %Y "$marker") ))
+      ((age < 30)) && exit 0
+    fi
+    touch "$marker"
+    notify-send -a WireGuard "$summary" "$body"
+  ) 9>"$STATE_DIR/$name.lock"
+}
+
+case ${1:-json} in
+  json) status_json ;;
+  up|down|restart) drive "$1" "${2:-}" ;;
+  probe) probe "${2:-}" ;;
+  notify) shift; notify_once "$@" ;;
+  *) echo "usage: omarchy-wireguard [json | up|down|restart NAME | probe HOST | notify NAME STATE SUMMARY [BODY]]" >&2; exit 2 ;;
+esac

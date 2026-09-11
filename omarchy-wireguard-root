@@ -1,0 +1,119 @@
+#!/bin/bash
+# omarchy-wireguard-root: the only part of the io.github.codemonkey76.wireguard
+# Omarchy widget that runs as root.
+#
+# install-helper copies it, root-owned, to /usr/local/libexec/omarchy-wireguard/
+# and adds a sudoers rule that lets one user run that copy, and nothing else,
+# without a password. The widget calls it through `sudo -n`.
+#
+# The command surface is fixed, and the only argument it accepts is a bare
+# tunnel name (never a path), so it can't be pointed at another config file:
+#
+#   version     helper protocol version, so the widget can spot a stale copy
+#   status      every configured and live tunnel, as JSON (no secrets)
+#   up NAME     wg-quick up NAME     (NAME must have a config in /etc/wireguard)
+#   down NAME   wg-quick down NAME
+#
+# Private and preshared keys never leave this script: config files are read
+# through a whitelist of non-secret keys, and of `wg show dump` only the peer
+# lines are read, minus the preshared-key column.
+
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
+umask 077
+
+VERSION=1
+CONF_DIR=/etc/wireguard
+# wg-quick's own interface-name rule, minus a leading "-" (which wg and
+# wg-quick would read as an option).
+NAME_RE='^[A-Za-z0-9_=+][A-Za-z0-9_=+.-]{0,14}$'
+
+fail() { echo "omarchy-wireguard-root: $*" >&2; exit 2; }
+
+configured() {  # configured NAME -> NAME, if it has a regular, non-symlink config
+  local name=${1:-}
+  [[ $name =~ $NAME_RE ]] || fail "invalid tunnel name"
+  [[ -f $CONF_DIR/$name.conf && ! -L $CONF_DIR/$name.conf ]] || fail "no config for $name in $CONF_DIR"
+  printf '%s' "$name"
+}
+
+# Whitelisted, non-secret lines of NAME.conf as "i|p <tab> key <tab> value".
+# PrivateKey and PresharedKey never match.
+conf_lines() {
+  awk '
+    /^[[:space:]]*\[/ { sec = tolower($0); gsub(/[][[:space:]]/, "", sec); next }
+    /^[[:space:]]*#/ || !/=/ { next }
+    {
+      key = $0; sub(/=.*/, "", key); gsub(/[[:space:]]/, "", key); key = tolower(key)
+      val = $0; sub(/^[^=]*=[[:space:]]*/, "", val); sub(/[[:space:]]+$/, "", val); gsub(/\t/, " ", val)
+      if (sec == "interface" && key ~ /^(address|dns|mtu|listenport)$/) print "i\t" key "\t" val
+      else if (sec == "interface" && key == "postup" && val ~ /resolvectl dns/) print "i\tpostupdns\t" val
+      else if (sec == "peer" && key ~ /^(publickey|endpoint|allowedips|persistentkeepalive)$/) print "p\t" key "\t" val
+    }' "$CONF_DIR/$1.conf"
+}
+
+status() {
+  local name names=() live=()
+  if [[ -d $CONF_DIR ]]; then
+    mapfile -t names < <(find "$CONF_DIR" -maxdepth 1 -type f -name '*.conf' -printf '%f\n' |
+      sed -n 's/\.conf$//p' | grep -E "$NAME_RE" || true)
+  fi
+  read -ra live <<<"$(wg show interfaces 2>/dev/null || true)"
+
+  {
+    for name in "${names[@]}"; do
+      [[ -L $CONF_DIR/$name.conf ]] && continue
+      printf 'conf\t%s\n' "$name"
+      conf_lines "$name"
+    done
+    for name in "${live[@]}"; do
+      [[ $name =~ $NAME_RE ]] || continue
+      printf 'live\t%s\t%s\n' "$name" "$(wg show "$name" listen-port 2>/dev/null || true)"
+      # Line 1 of the dump is the interface itself, private key included:
+      # skip it. Peer columns: pubkey psk endpoint allowed-ips handshake rx tx keepalive.
+      wg show "$name" dump 2>/dev/null | tail -n +2 |
+        awk -F'\t' 'NF >= 8 { print "peer\t" $1 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7 "\t" $8 }'
+    done
+  } | jq -cRn --argjson version "$VERSION" '
+    def items: split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""));
+    def num: tonumber? // null;
+    reduce (inputs | split("\t")) as $f ({version: $version, configs: {}, live: {}, c: null, l: null};
+      if $f[0] == "conf" then .c = $f[1] | .l = null | .configs[$f[1]] = {addresses: [], dns: [], peers: []}
+      elif $f[0] == "live" then .l = $f[1] | .c = null | .live[$f[1]] = {listenPort: ($f[2] | num), peers: []}
+      elif $f[0] == "peer" and .l != null then .live[.l].peers += [{
+          publicKey: $f[1],
+          endpoint: (if $f[2] == "(none)" then null else $f[2] end),
+          allowedIps: (if $f[3] == "(none)" then [] else ($f[3] | split(",")) end),
+          handshake: ($f[4] | num),
+          rx: ($f[5] | num),
+          tx: ($f[6] | num),
+          keepalive: (if $f[7] == "off" then null else ($f[7] | num) end)}]
+      elif .c != null then .c as $c |
+        if $f[0] == "p" and $f[1] == "publickey" then .configs[$c].peers += [{publicKey: $f[2], endpoint: null, allowedIps: [], keepalive: null}]
+        elif $f[0] == "p" then (.configs[$c].peers | length - 1) as $i |
+          if $i < 0 then .
+          elif $f[1] == "endpoint" then .configs[$c].peers[$i].endpoint = $f[2]
+          elif $f[1] == "allowedips" then .configs[$c].peers[$i].allowedIps += ($f[2] | items)
+          else .configs[$c].peers[$i].keepalive = ($f[2] | num) end
+        elif $f[1] == "address" then .configs[$c].addresses += ($f[2] | items)
+        elif $f[1] == "dns" then .configs[$c].dns += ($f[2] | items)
+        # "PostUp = resolvectl dns %i 10.8.0.53" is the systemd-resolved stand-in for DNS =
+        elif $f[1] == "postupdns" then .configs[$c].dns += [$f[2] | scan("resolvectl dns \\S+ ([^;&|]+)") | .[0] | split(" ")[] | select(. != "")]
+        elif $f[1] == "mtu" then .configs[$c].mtu = ($f[2] | num)
+        elif $f[1] == "listenport" then .configs[$c].listenPort = ($f[2] | num)
+        else . end
+      else . end)
+    | del(.c, .l)
+    | .configs |= map_values(.dns |= unique)'
+}
+
+case ${1:-} in
+  version) echo "$VERSION" ;;
+  status) status ;;
+  up|down)
+    [[ $# -eq 2 ]] || fail "usage: $1 NAME"
+    name=$(configured "$2")
+    exec wg-quick "$1" "$name"
+    ;;
+  *) fail "usage: version | status | up NAME | down NAME" ;;
+esac

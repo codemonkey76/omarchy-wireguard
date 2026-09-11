@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Installs the WireGuard widget's root helper, and a sudoers rule that lets you
+# run it (and only it) without a password. Re-run it after updating the plugin
+# if the widget says the helper is out of date.
+#
+#   ./install-helper            install or update
+#   ./install-helper --remove   remove the helper and the rule
+#
+# It installs two root-owned files, asking for your sudo password to do it:
+#   /usr/local/libexec/omarchy-wireguard/omarchy-wireguard-root   (0755)
+#   /etc/sudoers.d/omarchy-wireguard                               (0440)
+
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+dest_dir=/usr/local/libexec/omarchy-wireguard
+dest=$dest_dir/omarchy-wireguard-root
+rule=/etc/sudoers.d/omarchy-wireguard
+user=$(id -un)
+
+if [[ $user == root ]]; then
+  echo "Run this as your own user; it uses sudo where it needs to." >&2
+  exit 1
+fi
+[[ $user =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "Unexpected user name: $user" >&2; exit 1; }
+
+if [[ ${1:-} == --remove ]]; then
+  sudo rm -f -- "$rule"
+  sudo rm -rf -- "$dest_dir"
+  echo "Removed $rule and $dest_dir."
+  exit 0
+fi
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+cat >"$tmp" <<EOF
+# Installed by the io.github.codemonkey76.wireguard Omarchy widget (install-helper).
+# Lets $user run the widget's root helper, and nothing else, without a password.
+# The widget polls it every few seconds, so successful runs are not logged.
+Defaults!$dest !log_allowed, !pam_session
+$user ALL=(root) NOPASSWD: $dest
+EOF
+
+# Validate the rule before it goes anywhere near /etc/sudoers.d: a broken file
+# there can lock sudo out entirely.
+sudo visudo -cqf "$tmp"
+sudo install -d -o root -g root -m 0755 "$dest_dir"
+sudo install -o root -g root -m 0755 "$here/omarchy-wireguard-root" "$dest"
+sudo install -o root -g root -m 0440 "$tmp" "$rule"
+
+version=$(sudo -n "$dest" version 2>/dev/null || true)
+expected=$(sed -n 's/^VERSION=//p' "$here/omarchy-wireguard-root" | head -n 1)
+if [[ -n $version && $version == "$expected" ]]; then
+  echo "Installed the root helper (version $version). The widget picks it up within a few seconds."
+else
+  echo "Installed, but the helper didn't answer as expected (got '${version:-nothing}')." >&2
+  exit 1
+fi
