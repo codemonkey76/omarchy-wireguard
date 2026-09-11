@@ -102,7 +102,9 @@ Panel {
 
   readonly property string heroMeta: {
     if (!everLoaded) return failed ? "Couldn't read status" : "Loading…"
-    if (!selected) return "No tunnels in /etc/wireguard"
+    // Only the helper can see /etc/wireguard; without it, an empty list says
+    // nothing is up, not that nothing is configured.
+    if (!selected) return privileged ? "No tunnels in /etc/wireguard" : "No tunnel is up"
     var parts = [busyTunnel === selected.name ? busyLabel : Model.stateLabel(selectedState)]
     var address = Model.primaryAddress(selected)
     if (address) parts.push(address)
@@ -114,7 +116,7 @@ Panel {
 
   readonly property string tooltipText: !everLoaded
     ? (failed ? "WireGuard — couldn't read status" : "WireGuard — loading…")
-    : Model.tooltip(tunnels, now, labels, rates)
+    : Model.tooltip(tunnels, now, labels, rates, privileged)
 
   function stateColor(st) {
     if (st === "stale" || st === "connecting") return urgent

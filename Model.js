@@ -182,8 +182,12 @@ function probeHost(tunnel, probeSettings) {
   return dns.length ? String(dns[0]) : ""
 }
 
-function tooltip(tunnels, now, labels, rates) {
-  if (!tunnels || tunnels.length === 0) return "WireGuard — no tunnels configured"
+// Without the root helper an empty list means "nothing is up", not "nothing is
+// configured": /etc/wireguard is unreadable, so a config down there is invisible.
+function tooltip(tunnels, now, labels, rates, privileged) {
+  if (!tunnels || tunnels.length === 0)
+    return privileged === false ? "WireGuard — no tunnel up; configs need the root helper"
+                                : "WireGuard — no tunnels configured"
   var lines = []
   for (var i = 0; i < tunnels.length; i++) {
     var t = tunnels[i]

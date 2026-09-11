@@ -59,9 +59,8 @@ git clone https://github.com/codemonkey76/omarchy-wireguard \
 ~/.config/omarchy/plugins/io.github.codemonkey76.wireguard/install-helper
 ```
 
-Then add `{ "id": "io.github.codemonkey76.wireguard" }` to a bar section in
-`~/.config/omarchy/shell.json` and run `omarchy restart shell`. Move it later
-with `omarchy bar move io.github.codemonkey76.wireguard --section right`.
+`--enable` puts the widget in the bar's right section for you. Move it later
+with `omarchy bar move io.github.codemonkey76.wireguard --section left`.
 
 `install-helper` asks for your sudo password once. Re-run it after updating
 the plugin if the panel says the helper is out of date.
